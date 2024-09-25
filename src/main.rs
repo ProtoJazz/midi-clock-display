@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use embedded_graphics::{
     image::ImageRaw,
     mono_font::{mapping::StrGlyphMapping, DecorationDimensions, MonoFont, MonoTextStyle},
@@ -6,16 +8,20 @@ use embedded_graphics::{
     primitives::{PrimitiveStyle, Rectangle},
     text::{Alignment, Baseline, Text, TextStyle, TextStyleBuilder},
 };
-use esp_idf_svc::hal::uart::{config::Config, UartDriver};
-use esp_idf_svc::hal::units::FromValueType;
-use esp_idf_svc::hal::units::Hertz;
 use esp_idf_svc::hal::{
     gpio,
     i2c::{I2cConfig, I2cDriver},
 };
+use esp_idf_svc::hal::{gpio::Gpio2, units::Hertz};
 use esp_idf_svc::hal::{
     gpio::Gpio43, gpio::Gpio44, gpio::Gpio5, gpio::Gpio6, i2c::I2C0, peripherals::Peripherals,
     uart::UART1,
+};
+use esp_idf_svc::hal::{gpio::Input, units::FromValueType};
+use esp_idf_svc::hal::{
+    gpio::{InterruptType, PinDriver, Pull},
+    task::notification::Notification,
+    uart::{config::Config, UartDriver},
 };
 use esp_idf_svc::sys::esp_timer_get_time;
 use ssd1306::{mode::BufferedGraphicsMode, prelude::*, I2CDisplayInterface, Ssd1306};
@@ -29,7 +35,22 @@ const SEVENT_SEGMENT_FONT: MonoFont = MonoFont {
     underline: DecorationDimensions::default_underline(40),
     strikethrough: DecorationDimensions::default_strikethrough(40),
 };
+const SMALL_SEVENT_SEGMENT_FONT: MonoFont = MonoFont {
+    image: ImageRaw::new(include_bytes!("./seven-segment-font.raw"), 224),
+    glyph_mapping: &StrGlyphMapping::new("0123456789", 0),
+    character_size: Size::new(6, 10),
+    character_spacing: 4,
+    baseline: 4,
+    underline: DecorationDimensions::default_underline(5),
+    strikethrough: DecorationDimensions::default_strikethrough(5),
+};
 const UART_BUFFER_SIZE: usize = 1024;
+static BUTTON_PRESSED: AtomicBool = AtomicBool::new(false);
+fn gpio_isr_handler() {
+    // Set the BUTTON_PRESSED flag to true
+    BUTTON_PRESSED.store(true, Ordering::SeqCst);
+}
+
 fn main() -> anyhow::Result<()> {
     let peripherals = Peripherals::take().unwrap();
 
@@ -43,8 +64,23 @@ fn main() -> anyhow::Result<()> {
     let gpio6 = peripherals.pins.gpio6;
     let mut display = setup_i2c_display(i2c0, gpio5, gpio6)?;
 
+    // Configures the button
+    let mut button = PinDriver::input(peripherals.pins.gpio2)?;
+    button.set_pull(Pull::Up)?;
+    button.set_interrupt_type(InterruptType::NegEdge)?;
+
+    unsafe {
+        button.subscribe(gpio_isr_handler)?;
+    }
+    button.enable_interrupt()?;
     let character_style = MonoTextStyle::new(&SEVENT_SEGMENT_FONT, BinaryColor::On);
     let text_style = TextStyleBuilder::new()
+        .baseline(Baseline::Top)
+        .alignment(Alignment::Center)
+        .build();
+
+    let small_character_style = MonoTextStyle::new(&SMALL_SEVENT_SEGMENT_FONT, BinaryColor::On);
+    let small_text_style = TextStyleBuilder::new()
         .baseline(Baseline::Top)
         .alignment(Alignment::Center)
         .build();
@@ -59,6 +95,8 @@ fn main() -> anyhow::Result<()> {
     let mut clock_count = 0;
     let mut last_time = unsafe { esp_timer_get_time() };
 
+    let mut beats_per_bar: u32 = 4;
+
     update_display(
         &mut display,
         beat,
@@ -69,6 +107,21 @@ fn main() -> anyhow::Result<()> {
     loop {
         let mut buffer = [0u8; 1];
         let timeout = 400;
+        if BUTTON_PRESSED.load(Ordering::SeqCst) {
+            // Handle the button press event (change your value here)
+            println!("Button pressed! Changing value...");
+            beats_per_bar = match beats_per_bar {
+                3 => 4,
+                4 => 5,
+                5 => 7,
+                7 => 4,
+                _ => 4,
+            };
+            // Reset the flag
+            BUTTON_PRESSED.store(false, Ordering::SeqCst);
+
+            button.enable_interrupt()?;
+        }
 
         if let Ok(_) = uart.read(&mut buffer, timeout) {
             let midi_byte = buffer[0];
@@ -81,7 +134,7 @@ fn main() -> anyhow::Result<()> {
                         last_time = now;
                         bpm = (60.0 * 1_000_000.0) / time_per_beat as f64;
                         beat += 1;
-                        if beat > 4 {
+                        if beat > beats_per_bar {
                             beat = 1;
                         }
                         clock_count = 0;
@@ -93,10 +146,18 @@ fn main() -> anyhow::Result<()> {
                             character_style,
                             text_style,
                         );
+                        update_settings_display(
+                            &mut display,
+                            beats_per_bar,
+                            small_character_style,
+                            small_text_style,
+                        );
                     }
                 }
                 MIDI_START => {
                     beat = 1;
+                    let now = unsafe { esp_timer_get_time() };
+                    last_time = now;
                     update_display(
                         &mut display,
                         beat,
@@ -157,6 +218,32 @@ fn setup_midi_uart(uart1: UART1, gpio43: Gpio43, gpio44: Gpio44) -> UartDriver<'
     .unwrap();
     uart
 }
+
+fn update_settings_display(
+    display: &mut Ssd1306<
+        I2CInterface<I2cDriver<'_>>,
+        DisplaySize128x64,
+        BufferedGraphicsMode<DisplaySize128x64>,
+    >,
+    beats: u32,
+    character_style: MonoTextStyle<BinaryColor>,
+    text_style: TextStyle,
+) {
+    Rectangle::new(Point::zero(), Size::new(20, 64))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
+        .draw(display)
+        .unwrap();
+    Text::with_text_style(
+        &beats.to_string(),
+        Point::new(20, 20),
+        character_style,
+        text_style,
+    )
+    .draw(display)
+    .unwrap();
+    display.flush().unwrap();
+}
+
 fn update_display(
     display: &mut Ssd1306<
         I2CInterface<I2cDriver<'_>>,
@@ -168,14 +255,11 @@ fn update_display(
     character_style: MonoTextStyle<BinaryColor>,
     text_style: TextStyle,
 ) {
-    Rectangle::new(Point::zero(), Size::new(128, 64))
+    Rectangle::new(Point::new(20, 0), Size::new(128, 64))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
         .draw(display)
         .unwrap();
-    Rectangle::new(Point::new(0, 20), Size::new(15, 15))
-        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-        .draw(display)
-        .unwrap();
+
     Text::with_text_style(
         &bpm.to_string(),
         Point::new(45, 20),
