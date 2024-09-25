@@ -6,13 +6,16 @@ use embedded_graphics::{
     primitives::{PrimitiveStyle, Rectangle},
     text::{Alignment, Baseline, Text, TextStyle, TextStyleBuilder},
 };
-use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::uart::{config::Config, UartDriver};
 use esp_idf_svc::hal::units::FromValueType;
 use esp_idf_svc::hal::units::Hertz;
 use esp_idf_svc::hal::{
     gpio,
     i2c::{I2cConfig, I2cDriver},
+};
+use esp_idf_svc::hal::{
+    gpio::Gpio43, gpio::Gpio44, gpio::Gpio5, gpio::Gpio6, i2c::I2C0, peripherals::Peripherals,
+    uart::UART1,
 };
 use esp_idf_svc::sys::esp_timer_get_time;
 use ssd1306::{mode::BufferedGraphicsMode, prelude::*, I2CDisplayInterface, Ssd1306};
@@ -30,37 +33,15 @@ const UART_BUFFER_SIZE: usize = 1024;
 fn main() -> anyhow::Result<()> {
     let peripherals = Peripherals::take().unwrap();
 
-    let uart_config = Config::default()
-        .baudrate(Hertz::from(31_250))
-        .rx_fifo_size(UART_BUFFER_SIZE);
+    let uart1 = peripherals.uart1;
+    let gpio43 = peripherals.pins.gpio43;
+    let gpio44 = peripherals.pins.gpio44;
+    let uart = setup_midi_uart(uart1, gpio43, gpio44);
 
-    let uart = UartDriver::new(
-        peripherals.uart1,
-        peripherals.pins.gpio43,
-        peripherals.pins.gpio44,
-        Option::<gpio::Gpio0>::None,
-        Option::<gpio::Gpio1>::None,
-        &uart_config,
-    )
-    .unwrap();
-
-    let i2c_config = I2cConfig::new().baudrate(100_u32.kHz().into());
-
-    let i2c_driver = I2cDriver::new(
-        peripherals.i2c0,
-        peripherals.pins.gpio5, // SDA
-        peripherals.pins.gpio6, // SCL
-        &i2c_config,
-    )?;
-
-    let i2c_interface = I2CDisplayInterface::new(i2c_driver);
-
-    let mut display = Ssd1306::new(i2c_interface, DisplaySize128x64, DisplayRotation::Rotate0)
-        .into_buffered_graphics_mode();
-    match display.init() {
-        Ok(_) => println!("Display initialized"),
-        Err(e) => println!("Failed to initialize display: {:?}", e),
-    }
+    let i2c0 = peripherals.i2c0;
+    let gpio5 = peripherals.pins.gpio5;
+    let gpio6 = peripherals.pins.gpio6;
+    let mut display = setup_i2c_display(i2c0, gpio5, gpio6)?;
 
     let character_style = MonoTextStyle::new(&SEVENT_SEGMENT_FONT, BinaryColor::On);
     let text_style = TextStyleBuilder::new()
@@ -91,19 +72,31 @@ fn main() -> anyhow::Result<()> {
 
         if let Ok(_) = uart.read(&mut buffer, timeout) {
             let midi_byte = buffer[0];
-            if midi_byte == MIDI_CLOCK {
-                clock_count += 1;
-                if clock_count == CLOCKS_PER_BEAT {
-                    let now = unsafe { esp_timer_get_time() };
-                    let time_per_beat = now - last_time;
-                    last_time = now;
-                    bpm = (60.0 * 1_000_000.0) / time_per_beat as f64;
-                    beat += 1;
-                    if beat > 4 {
-                        beat = 1;
-                    }
-                    clock_count = 0;
+            match midi_byte {
+                MIDI_CLOCK => {
+                    clock_count += 1;
+                    if clock_count == CLOCKS_PER_BEAT {
+                        let now = unsafe { esp_timer_get_time() };
+                        let time_per_beat = now - last_time;
+                        last_time = now;
+                        bpm = (60.0 * 1_000_000.0) / time_per_beat as f64;
+                        beat += 1;
+                        if beat > 4 {
+                            beat = 1;
+                        }
+                        clock_count = 0;
 
+                        update_display(
+                            &mut display,
+                            beat,
+                            bpm.round() as u32,
+                            character_style,
+                            text_style,
+                        );
+                    }
+                }
+                MIDI_START => {
+                    beat = 1;
                     update_display(
                         &mut display,
                         beat,
@@ -112,22 +105,57 @@ fn main() -> anyhow::Result<()> {
                         text_style,
                     );
                 }
-            } else if midi_byte == MIDI_START {
-                beat = 1;
-                update_display(
-                    &mut display,
-                    beat,
-                    bpm.round() as u32,
-                    character_style,
-                    text_style,
-                );
-            } else if midi_byte == EMPTY_BUFFER {
-                continue;
-            } else {
-                continue;
+                EMPTY_BUFFER => continue,
+                _ => continue,
             }
         }
     }
+}
+
+fn setup_i2c_display(
+    i2c0: I2C0,
+    gpio5: Gpio5,
+    gpio6: Gpio6,
+) -> Result<
+    Ssd1306<
+        I2CInterface<I2cDriver<'static>>,
+        DisplaySize128x64,
+        BufferedGraphicsMode<DisplaySize128x64>,
+    >,
+    anyhow::Error,
+> {
+    let i2c_config = I2cConfig::new().baudrate(100_u32.kHz().into());
+    let i2c_driver = I2cDriver::new(
+        i2c0,
+        gpio5, // SDA
+        gpio6, // SCL
+        &i2c_config,
+    )?;
+    let i2c_interface = I2CDisplayInterface::new(i2c_driver);
+    let mut display = Ssd1306::new(i2c_interface, DisplaySize128x64, DisplayRotation::Rotate0)
+        .into_buffered_graphics_mode();
+    match display.init() {
+        Ok(_) => println!("Display initialized"),
+        Err(e) => println!("Failed to initialize display: {:?}", e),
+    }
+    Ok(display)
+}
+
+fn setup_midi_uart(uart1: UART1, gpio43: Gpio43, gpio44: Gpio44) -> UartDriver<'static> {
+    let uart_config = Config::default()
+        .baudrate(Hertz::from(31_250))
+        .rx_fifo_size(UART_BUFFER_SIZE);
+
+    let uart = UartDriver::new(
+        uart1,
+        gpio43,
+        gpio44,
+        Option::<gpio::Gpio0>::None,
+        Option::<gpio::Gpio1>::None,
+        &uart_config,
+    )
+    .unwrap();
+    uart
 }
 fn update_display(
     display: &mut Ssd1306<
