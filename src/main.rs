@@ -1,26 +1,30 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    ops::ControlFlow,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use embedded_graphics::{
     image::ImageRaw,
-    mono_font::{mapping::StrGlyphMapping, DecorationDimensions, MonoFont, MonoTextStyle},
+    mono_font::{
+        ascii::FONT_6X12, mapping::StrGlyphMapping, DecorationDimensions, MonoFont, MonoTextStyle,
+    },
     pixelcolor::BinaryColor,
     prelude::*,
     primitives::{PrimitiveStyle, Rectangle},
     text::{Alignment, Baseline, Text, TextStyle, TextStyleBuilder},
 };
+use esp_idf_svc::hal::units::FromValueType;
+use esp_idf_svc::hal::units::Hertz;
 use esp_idf_svc::hal::{
     gpio,
     i2c::{I2cConfig, I2cDriver},
 };
-use esp_idf_svc::hal::{gpio::Gpio2, units::Hertz};
 use esp_idf_svc::hal::{
     gpio::Gpio43, gpio::Gpio44, gpio::Gpio5, gpio::Gpio6, i2c::I2C0, peripherals::Peripherals,
     uart::UART1,
 };
-use esp_idf_svc::hal::{gpio::Input, units::FromValueType};
 use esp_idf_svc::hal::{
     gpio::{InterruptType, PinDriver, Pull},
-    task::notification::Notification,
     uart::{config::Config, UartDriver},
 };
 use esp_idf_svc::sys::esp_timer_get_time;
@@ -35,17 +39,15 @@ const SEVENT_SEGMENT_FONT: MonoFont = MonoFont {
     underline: DecorationDimensions::default_underline(40),
     strikethrough: DecorationDimensions::default_strikethrough(40),
 };
-const SMALL_SEVENT_SEGMENT_FONT: MonoFont = MonoFont {
-    image: ImageRaw::new(include_bytes!("./seven-segment-font.raw"), 224),
-    glyph_mapping: &StrGlyphMapping::new("0123456789", 0),
-    character_size: Size::new(6, 10),
-    character_spacing: 4,
-    baseline: 4,
-    underline: DecorationDimensions::default_underline(5),
-    strikethrough: DecorationDimensions::default_strikethrough(5),
-};
 const UART_BUFFER_SIZE: usize = 1024;
 static BUTTON_PRESSED: AtomicBool = AtomicBool::new(false);
+const MIDI_CLOCK: u8 = 0xF8;
+const MIDI_START: u8 = 0xF2;
+const EMPTY_BUFFER: u8 = 0x00;
+const CLOCKS_PER_BEAT: u32 = 24;
+const CONTROL_CHANNEL: u32 = 10;
+const CONTROL_BYTE: u8 = (0xB0 + (CONTROL_CHANNEL - 1)) as u8;
+const MIDI_LOGGING: bool = false;
 fn gpio_isr_handler() {
     // Set the BUTTON_PRESSED flag to true
     BUTTON_PRESSED.store(true, Ordering::SeqCst);
@@ -79,16 +81,7 @@ fn main() -> anyhow::Result<()> {
         .alignment(Alignment::Center)
         .build();
 
-    let small_character_style = MonoTextStyle::new(&SMALL_SEVENT_SEGMENT_FONT, BinaryColor::On);
-    let small_text_style = TextStyleBuilder::new()
-        .baseline(Baseline::Top)
-        .alignment(Alignment::Center)
-        .build();
-
-    const MIDI_CLOCK: u8 = 0xF8;
-    const MIDI_START: u8 = 0xF2;
-    const EMPTY_BUFFER: u8 = 0x00;
-    const CLOCKS_PER_BEAT: u32 = 24;
+    let small_character_style = MonoTextStyle::new(&FONT_6X12, BinaryColor::On);
 
     let mut beat: u32 = 1;
     let mut bpm = 0.0 as f64;
@@ -104,6 +97,7 @@ fn main() -> anyhow::Result<()> {
         character_style,
         text_style,
     );
+    display.flush().unwrap();
     loop {
         let mut buffer = [0u8; 1];
         let timeout = 400;
@@ -122,55 +116,112 @@ fn main() -> anyhow::Result<()> {
 
             button.enable_interrupt()?;
         }
+        if uart.read(&mut buffer, timeout).is_ok() {
+            let status_byte = buffer[0];
 
-        if let Ok(_) = uart.read(&mut buffer, timeout) {
-            let midi_byte = buffer[0];
-            match midi_byte {
-                MIDI_CLOCK => {
-                    clock_count += 1;
-                    if clock_count == CLOCKS_PER_BEAT {
-                        let now = unsafe { esp_timer_get_time() };
-                        let time_per_beat = now - last_time;
-                        last_time = now;
-                        bpm = (60.0 * 1_000_000.0) / time_per_beat as f64;
-                        beat += 1;
-                        if beat > beats_per_bar {
-                            beat = 1;
-                        }
-                        clock_count = 0;
+            let num_data_bytes = get_data_byte_count(status_byte);
 
-                        update_display(
-                            &mut display,
-                            beat,
-                            bpm.round() as u32,
-                            character_style,
-                            text_style,
-                        );
-                        update_settings_display(
-                            &mut display,
-                            beats_per_bar,
-                            small_character_style,
-                            small_text_style,
-                        );
-                    }
+            // Read the required number of data bytes
+            let mut data_bytes = vec![0u8; num_data_bytes];
+            println!("data bytes {}", num_data_bytes);
+            for i in 0..num_data_bytes {
+                if uart.read(&mut buffer, timeout).is_ok() {
+                    data_bytes[i] = buffer[0];
+                } else {
+                    continue;
                 }
-                MIDI_START => {
-                    beat = 1;
-                    let now = unsafe { esp_timer_get_time() };
-                    last_time = now;
-                    update_display(
-                        &mut display,
-                        beat,
-                        bpm.round() as u32,
-                        character_style,
-                        text_style,
-                    );
-                }
-                EMPTY_BUFFER => continue,
-                _ => continue,
+            }
+            if let ControlFlow::Break(_) = handle_midi(
+                MidiMessage {
+                    status_byte,
+                    data_bytes,
+                },
+                &mut clock_count,
+                &mut last_time,
+                &mut bpm,
+                &mut beat,
+                beats_per_bar,
+                &mut display,
+                character_style,
+                text_style,
+                small_character_style,
+            ) {
+                continue;
             }
         }
     }
+}
+
+fn handle_midi(
+    midi_message: MidiMessage,
+    clock_count: &mut u32,
+    last_time: &mut i64,
+    bpm: &mut f64,
+    beat: &mut u32,
+    beats_per_bar: u32,
+    display: &mut Ssd1306<
+        I2CInterface<I2cDriver<'_>>,
+        DisplaySize128x64,
+        BufferedGraphicsMode<DisplaySize128x64>,
+    >,
+    character_style: MonoTextStyle<'_, BinaryColor>,
+    text_style: TextStyle,
+    small_character_style: MonoTextStyle<'_, BinaryColor>,
+) -> ControlFlow<()> {
+    let channel = get_midi_channel(midi_message.status_byte);
+    if MIDI_LOGGING {
+        println!(
+            "MIDI message - Status Byte: {:#02X}, Channel: {}, Data Bytes: {:?}",
+            midi_message.status_byte, // The status byte as a hexadecimal value
+            channel + 1,              // The channel (adding 1 since MIDI channels are 1-16)
+            midi_message.data_bytes   // The data bytes as a vector, printed using Debug format
+        );
+    }
+    match midi_message.status_byte {
+        MIDI_CLOCK => {
+            *clock_count += 1;
+            if *clock_count == CLOCKS_PER_BEAT {
+                let now = unsafe { esp_timer_get_time() };
+                let time_per_beat = now - *last_time;
+                *last_time = now;
+                *bpm = (60.0 * 1_000_000.0) / time_per_beat as f64;
+                *beat += 1;
+                if *beat > beats_per_bar {
+                    *beat = 1;
+                }
+                *clock_count = 0;
+
+                update_display(
+                    display,
+                    *beat,
+                    bpm.round() as u32,
+                    character_style,
+                    text_style,
+                );
+                update_settings_display(display, beats_per_bar, small_character_style, text_style);
+                display.flush().unwrap();
+            }
+        }
+        MIDI_START => {
+            *beat = 1;
+            let now = unsafe { esp_timer_get_time() };
+            *last_time = now;
+            update_display(
+                display,
+                *beat,
+                bpm.round() as u32,
+                character_style,
+                text_style,
+            );
+            display.flush().unwrap();
+        }
+        CONTROL_BYTE => {
+            println!("Stuff goes here to control the clock by midi");
+        }
+        EMPTY_BUFFER => return ControlFlow::Break(()),
+        _ => return ControlFlow::Break(()),
+    }
+    ControlFlow::Continue(())
 }
 
 fn setup_i2c_display(
@@ -229,19 +280,18 @@ fn update_settings_display(
     character_style: MonoTextStyle<BinaryColor>,
     text_style: TextStyle,
 ) {
-    Rectangle::new(Point::zero(), Size::new(20, 64))
+    Rectangle::new(Point::zero(), Size::new(10, 64))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
         .draw(display)
         .unwrap();
     Text::with_text_style(
         &beats.to_string(),
-        Point::new(20, 20),
+        Point::new(10, 20),
         character_style,
         text_style,
     )
     .draw(display)
     .unwrap();
-    display.flush().unwrap();
 }
 
 fn update_display(
@@ -255,7 +305,7 @@ fn update_display(
     character_style: MonoTextStyle<BinaryColor>,
     text_style: TextStyle,
 ) {
-    Rectangle::new(Point::new(20, 0), Size::new(128, 64))
+    Rectangle::new(Point::new(10, 0), Size::new(118, 64))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
         .draw(display)
         .unwrap();
@@ -276,5 +326,28 @@ fn update_display(
     )
     .draw(display)
     .unwrap();
-    display.flush().unwrap();
+}
+
+fn get_midi_channel(status_byte: u8) -> u8 {
+    status_byte & 0x0F // Extract the lower nibble
+}
+
+// Function to determine the number of data bytes based on the status byte
+fn get_data_byte_count(status_byte: u8) -> usize {
+    match status_byte & 0xF0 {
+        0x80 => 2, // Note Off (status byte + 2 data bytes)
+        0x90 => 2, // Note On (status byte + 2 data bytes)
+        0xA0 => 2, // Polyphonic Key Pressure (status byte + 2 data bytes)
+        0xB0 => 2, // Control Change (status byte + 2 data bytes)
+        0xC0 => 1, // Program Change (status byte + 1 data byte)
+        0xD0 => 1, // Channel Pressure (status byte + 1 data byte)
+        0xE0 => 2, // Pitch Bend Change (status byte + 2 data bytes)
+        _ => 0,    // System messages like Timing Clock (no data bytes)
+    }
+}
+
+// Struct to represent a complete MIDI message
+struct MidiMessage {
+    status_byte: u8,
+    data_bytes: Vec<u8>,
 }
