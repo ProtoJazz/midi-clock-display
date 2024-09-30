@@ -3,6 +3,8 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+use embassy_executor::{raw::Executor, Spawner};
+use embassy_time::{Duration, Timer};
 use embedded_graphics::{
     image::ImageRaw,
     mono_font::{
@@ -13,6 +15,7 @@ use embedded_graphics::{
     primitives::{PrimitiveStyle, Rectangle},
     text::{Alignment, Baseline, Text, TextStyle, TextStyleBuilder},
 };
+use embedded_io_async::{Read, Write};
 use esp_idf_svc::hal::units::FromValueType;
 use esp_idf_svc::hal::units::Hertz;
 use esp_idf_svc::hal::{
@@ -48,12 +51,21 @@ const CLOCKS_PER_BEAT: u32 = 24;
 const CONTROL_CHANNEL: u32 = 10;
 const CONTROL_BYTE: u8 = (0xB0 + (CONTROL_CHANNEL - 1)) as u8;
 const MIDI_LOGGING: bool = false;
+const UART_TIMEOUT: u32 = 400;
+
 fn gpio_isr_handler() {
     // Set the BUTTON_PRESSED flag to true
     BUTTON_PRESSED.store(true, Ordering::SeqCst);
 }
+static EXECUTOR: Executor = Executor::new();
 
-fn main() -> anyhow::Result<()> {
+fn main() {
+    // Start the executor
+    EXECUTOR.run(async_main());
+}
+
+#[embassy_executor::task]
+async fn async_main(spawner: Spawner) {
     let peripherals = Peripherals::take().unwrap();
 
     let uart1 = peripherals.uart1;
@@ -98,9 +110,8 @@ fn main() -> anyhow::Result<()> {
         text_style,
     );
     display.flush().unwrap();
+    handle_midi(uart).await;
     loop {
-        let mut buffer = [0u8; 1];
-        let timeout = 400;
         if BUTTON_PRESSED.load(Ordering::SeqCst) {
             // Handle the button press event (change your value here)
             println!("Button pressed! Changing value...");
@@ -116,58 +127,17 @@ fn main() -> anyhow::Result<()> {
 
             button.enable_interrupt()?;
         }
-        if uart.read(&mut buffer, timeout).is_ok() {
-            let status_byte = buffer[0];
-
-            let num_data_bytes = get_data_byte_count(status_byte);
-
-            // Read the required number of data bytes
-            let mut data_bytes = vec![0u8; num_data_bytes];
-            println!("data bytes {}", num_data_bytes);
-            for i in 0..num_data_bytes {
-                if uart.read(&mut buffer, timeout).is_ok() {
-                    data_bytes[i] = buffer[0];
-                } else {
-                    continue;
-                }
-            }
-            if let ControlFlow::Break(_) = handle_midi(
-                MidiMessage {
-                    status_byte,
-                    data_bytes,
-                },
-                &mut clock_count,
-                &mut last_time,
-                &mut bpm,
-                &mut beat,
-                beats_per_bar,
-                &mut display,
-                character_style,
-                text_style,
-                small_character_style,
-            ) {
-                continue;
-            }
-        }
     }
+    return Ok(());
 }
 
 fn handle_midi(
     midi_message: MidiMessage,
-    clock_count: &mut u32,
-    last_time: &mut i64,
-    bpm: &mut f64,
-    beat: &mut u32,
+    clock_count: u32,
+    last_time: u64,
+    beat: u32,
     beats_per_bar: u32,
-    display: &mut Ssd1306<
-        I2CInterface<I2cDriver<'_>>,
-        DisplaySize128x64,
-        BufferedGraphicsMode<DisplaySize128x64>,
-    >,
-    character_style: MonoTextStyle<'_, BinaryColor>,
-    text_style: TextStyle,
-    small_character_style: MonoTextStyle<'_, BinaryColor>,
-) -> ControlFlow<()> {
+) -> ClockReadResult {
     let channel = get_midi_channel(midi_message.status_byte);
     if MIDI_LOGGING {
         println!(
@@ -179,49 +149,72 @@ fn handle_midi(
     }
     match midi_message.status_byte {
         MIDI_CLOCK => {
-            *clock_count += 1;
-            if *clock_count == CLOCKS_PER_BEAT {
-                let now = unsafe { esp_timer_get_time() };
-                let time_per_beat = now - *last_time;
-                *last_time = now;
-                *bpm = (60.0 * 1_000_000.0) / time_per_beat as f64;
-                *beat += 1;
-                if *beat > beats_per_bar {
-                    *beat = 1;
+            let mut new_clock = clock_count + 1;
+            if new_clock == CLOCKS_PER_BEAT {
+                let mut now = unsafe { esp_timer_get_time() as u64 };
+                let time_per_beat = now - last_time;
+                let bpm = (60.0 * 1_000_000.0) / time_per_beat as f64;
+                let mut next_beat = beat + 1;
+                if next_beat > beats_per_bar {
+                    next_beat = 1;
                 }
-                *clock_count = 0;
-
-                update_display(
-                    display,
-                    *beat,
-                    bpm.round() as u32,
-                    character_style,
-                    text_style,
-                );
-                update_settings_display(display, beats_per_bar, small_character_style, text_style);
-                display.flush().unwrap();
+                new_clock = 0;
+                return ClockReadResult {
+                    beat: next_beat,
+                    bpm,
+                    check_time: now,
+                    clock_count: new_clock,
+                };
+            } else {
+                let now = unsafe { esp_timer_get_time() as u64 };
+                let time_per_beat = (now - last_time) as f64;
+                let bpm = (60.0 * 1_000_000.0) / time_per_beat as f64;
+                return ClockReadResult {
+                    beat: beat + 1,
+                    bpm,
+                    check_time: now,
+                    clock_count: new_clock,
+                };
             }
         }
+
         MIDI_START => {
-            *beat = 1;
-            let now = unsafe { esp_timer_get_time() };
-            *last_time = now;
-            update_display(
-                display,
-                *beat,
-                bpm.round() as u32,
-                character_style,
-                text_style,
-            );
-            display.flush().unwrap();
+            let now = unsafe { esp_timer_get_time() as u64 };
+            let time_per_beat = (now - last_time) as f64;
+            let bpm = (60.0 * 1_000_000.0) / time_per_beat as f64;
+            return ClockReadResult {
+                beat: 1,
+                bpm,
+                check_time: now,
+                clock_count: 0,
+            };
         }
         CONTROL_BYTE => {
             println!("Stuff goes here to control the clock by midi");
+            return ClockReadResult {
+                beat: 0,
+                bpm: 0.0,
+                check_time: 0,
+                clock_count: 0,
+            };
         }
-        EMPTY_BUFFER => return ControlFlow::Break(()),
-        _ => return ControlFlow::Break(()),
+        EMPTY_BUFFER => {
+            return ClockReadResult {
+                beat: 0,
+                bpm: 0.0,
+                check_time: 0,
+                clock_count: 0,
+            };
+        }
+        _ => {
+            return ClockReadResult {
+                beat: 0,
+                bpm: 0.0,
+                check_time: 0,
+                clock_count: 0,
+            };
+        }
     }
-    ControlFlow::Continue(())
 }
 
 fn setup_i2c_display(
@@ -350,4 +343,79 @@ fn get_data_byte_count(status_byte: u8) -> usize {
 struct MidiMessage {
     status_byte: u8,
     data_bytes: Vec<u8>,
+}
+struct ClockReadResult {
+    clock_count: u32,
+    beat: u32,
+    bpm: f64,
+    check_time: u64,
+}
+
+#[embassy_executor::task]
+async fn read_midi(
+    mut uart: UartDriver<'static>,
+    character_style: MonoTextStyle<'_, BinaryColor>,
+    text_style: TextStyle,
+    small_character_style: MonoTextStyle<'_, BinaryColor>,
+) {
+    let mut buffer = [0u8; 1];
+    let mut beat: u32 = 1;
+    let mut bpm = 0.0 as f64;
+    let mut clock_count = 0;
+    let last_time = unsafe { esp_timer_get_time() as u64 };
+
+    let mut beats_per_bar: u32 = 4;
+    loop {
+        match uart.read(&mut buffer, UART_TIMEOUT) {
+            Ok(_) => {
+                let status_byte = buffer[0];
+
+                let num_data_bytes = get_data_byte_count(status_byte);
+
+                // Read the required number of data bytes
+                let mut data_bytes = vec![0u8; num_data_bytes];
+                println!("data bytes {}", num_data_bytes);
+                for i in 0..num_data_bytes {
+                    if uart.read(&mut buffer, UART_TIMEOUT).is_ok() {
+                        data_bytes[i] = buffer[0];
+                    } else {
+                        continue;
+                    }
+                }
+
+                let midi_read_result = handle_midi(
+                    MidiMessage {
+                        status_byte,
+                        data_bytes,
+                    },
+                    clock_count,
+                    last_time,
+                    beat,
+                    beats_per_bar,
+                );
+
+                // if let ControlFlow::Break(_) = handle_midi(
+                //     MidiMessage {
+                //         status_byte,
+                //         data_bytes,
+                //     },
+                //     &mut clock_count,
+                //     &mut last_time,
+                //     &mut bpm,
+                //     &mut beat,
+                //     beats_per_bar,
+                //     &mut display,
+                //     character_style,
+                //     text_style,
+                //     small_character_style,
+                // ) {
+                //     continue;
+                // }
+            }
+            Err(_) => {
+                // Handle error
+            }
+        }
+        Timer::after(Duration::from_millis(1)).await; // Sleep to prevent tight looping
+    }
 }
