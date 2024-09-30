@@ -47,6 +47,7 @@ const EMPTY_BUFFER: u8 = 0x00;
 const CLOCKS_PER_BEAT: u32 = 24;
 const CONTROL_CHANNEL: u32 = 10;
 const CONTROL_BYTE: u8 = (0xB0 + (CONTROL_CHANNEL - 1)) as u8;
+const MIDI_PAUSE: u8 = 0xFC;
 const MIDI_LOGGING: bool = false;
 fn gpio_isr_handler() {
     // Set the BUTTON_PRESSED flag to true
@@ -97,6 +98,12 @@ fn main() -> anyhow::Result<()> {
         character_style,
         text_style,
     );
+    update_settings_display(
+        &mut display,
+        beats_per_bar,
+        small_character_style,
+        text_style,
+    );
     display.flush().unwrap();
     loop {
         let mut buffer = [0u8; 1];
@@ -113,7 +120,12 @@ fn main() -> anyhow::Result<()> {
             };
             // Reset the flag
             BUTTON_PRESSED.store(false, Ordering::SeqCst);
-
+            update_settings_display(
+                &mut display,
+                beats_per_bar,
+                small_character_style,
+                text_style,
+            );
             button.enable_interrupt()?;
         }
         if uart.read(&mut buffer, timeout).is_ok() {
@@ -123,7 +135,6 @@ fn main() -> anyhow::Result<()> {
 
             // Read the required number of data bytes
             let mut data_bytes = vec![0u8; num_data_bytes];
-            println!("data bytes {}", num_data_bytes);
             for i in 0..num_data_bytes {
                 if uart.read(&mut buffer, timeout).is_ok() {
                     data_bytes[i] = buffer[0];
@@ -144,7 +155,6 @@ fn main() -> anyhow::Result<()> {
                 &mut display,
                 character_style,
                 text_style,
-                small_character_style,
             ) {
                 continue;
             }
@@ -166,7 +176,6 @@ fn handle_midi(
     >,
     character_style: MonoTextStyle<'_, BinaryColor>,
     text_style: TextStyle,
-    small_character_style: MonoTextStyle<'_, BinaryColor>,
 ) -> ControlFlow<()> {
     let channel = get_midi_channel(midi_message.status_byte);
     if MIDI_LOGGING {
@@ -198,12 +207,12 @@ fn handle_midi(
                     character_style,
                     text_style,
                 );
-                update_settings_display(display, beats_per_bar, small_character_style, text_style);
                 display.flush().unwrap();
             }
         }
-        MIDI_START => {
+        MIDI_START | MIDI_PAUSE => {
             *beat = 1;
+            *clock_count = 0;
             let now = unsafe { esp_timer_get_time() };
             *last_time = now;
             update_display(
@@ -280,13 +289,13 @@ fn update_settings_display(
     character_style: MonoTextStyle<BinaryColor>,
     text_style: TextStyle,
 ) {
-    Rectangle::new(Point::zero(), Size::new(10, 64))
+    Rectangle::new(Point::zero(), Size::new(12, 64))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
         .draw(display)
         .unwrap();
     Text::with_text_style(
         &beats.to_string(),
-        Point::new(10, 20),
+        Point::new(9, 20),
         character_style,
         text_style,
     )
@@ -305,7 +314,7 @@ fn update_display(
     character_style: MonoTextStyle<BinaryColor>,
     text_style: TextStyle,
 ) {
-    Rectangle::new(Point::new(10, 0), Size::new(118, 64))
+    Rectangle::new(Point::new(12, 0), Size::new(118, 64))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
         .draw(display)
         .unwrap();
