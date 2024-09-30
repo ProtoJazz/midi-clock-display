@@ -49,6 +49,8 @@ const CONTROL_CHANNEL: u32 = 10;
 const CONTROL_BYTE: u8 = (0xB0 + (CONTROL_CHANNEL - 1)) as u8;
 const MIDI_PAUSE: u8 = 0xFC;
 const MIDI_LOGGING: bool = false;
+const SMOOTHING_FACTOR: usize = 8; // Adjust this as needed
+
 fn gpio_isr_handler() {
     // Set the BUTTON_PRESSED flag to true
     BUTTON_PRESSED.store(true, Ordering::SeqCst);
@@ -105,6 +107,8 @@ fn main() -> anyhow::Result<()> {
         text_style,
     );
     display.flush().unwrap();
+    let mut bpm_history: [f64; SMOOTHING_FACTOR] = [0.0; SMOOTHING_FACTOR];
+    let mut bpm_index = 0;
     loop {
         let mut buffer = [0u8; 1];
         let timeout = 400;
@@ -155,6 +159,8 @@ fn main() -> anyhow::Result<()> {
                 &mut display,
                 character_style,
                 text_style,
+                &mut bpm_history,
+                &mut bpm_index,
             ) {
                 continue;
             }
@@ -176,6 +182,8 @@ fn handle_midi(
     >,
     character_style: MonoTextStyle<'_, BinaryColor>,
     text_style: TextStyle,
+    bpm_history: &mut [f64; SMOOTHING_FACTOR],
+    bpm_index: &mut usize,
 ) -> ControlFlow<()> {
     let channel = get_midi_channel(midi_message.status_byte);
     if MIDI_LOGGING {
@@ -186,20 +194,33 @@ fn handle_midi(
             midi_message.data_bytes   // The data bytes as a vector, printed using Debug format
         );
     }
+
     match midi_message.status_byte {
         MIDI_CLOCK => {
             *clock_count += 1;
+            let now = unsafe { esp_timer_get_time() }; // Current time in microseconds
+            let time_per_clock = now - *last_time; // Time difference between this clock and the last one
+            *last_time = now;
+
+            // Calculate BPM using time per clock event
+            let bpm_per_clock =
+                (60.0 * 1_000_000.0) / (time_per_clock as f64 * CLOCKS_PER_BEAT as f64);
+            bpm_history[*bpm_index % SMOOTHING_FACTOR] = bpm_per_clock;
+            *bpm_index = (*bpm_index + 1) % SMOOTHING_FACTOR;
+
+            // Calculate the moving average BPM
+            let avg_bpm: f64 = bpm_history.iter().sum::<f64>() / SMOOTHING_FACTOR as f64;
+            *bpm = avg_bpm;
+
+            // If clock count matches clocks per beat, update the beat
             if *clock_count == CLOCKS_PER_BEAT {
-                let now = unsafe { esp_timer_get_time() };
-                let time_per_beat = now - *last_time;
-                *last_time = now;
-                *bpm = (60.0 * 1_000_000.0) / time_per_beat as f64;
                 *beat += 1;
                 if *beat > beats_per_bar {
                     *beat = 1;
                 }
-                *clock_count = 0;
+                *clock_count = 0; // Reset the clock count after a full beat
 
+                // Update display with the current beat and BPM
                 update_display(
                     display,
                     *beat,
