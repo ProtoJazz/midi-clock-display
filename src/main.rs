@@ -1,6 +1,6 @@
 use std::{
     ops::ControlFlow,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU32, Ordering},
 };
 
 use embedded_graphics::{
@@ -41,6 +41,7 @@ const SEVENT_SEGMENT_FONT: MonoFont = MonoFont {
 };
 const UART_BUFFER_SIZE: usize = 1024;
 static BUTTON_PRESSED: AtomicBool = AtomicBool::new(false);
+static BEATS_PER_BAR: AtomicU32 = AtomicU32::new(4);
 const MIDI_CLOCK: u8 = 0xF8;
 const MIDI_START: u8 = 0xF2;
 const EMPTY_BUFFER: u8 = 0x00;
@@ -50,6 +51,8 @@ const CONTROL_BYTE: u8 = (0xB0 + (CONTROL_CHANNEL - 1)) as u8;
 const MIDI_PAUSE: u8 = 0xFC;
 const MIDI_LOGGING: bool = false;
 const SMOOTHING_FACTOR: usize = 8; // Adjust this as needed
+const SYSEX_START: u8 = 0xF0;
+const SYSEX_END: u8 = 0xF7;
 
 fn gpio_isr_handler() {
     // Set the BUTTON_PRESSED flag to true
@@ -100,12 +103,7 @@ fn main() -> anyhow::Result<()> {
         character_style,
         text_style,
     );
-    update_settings_display(
-        &mut display,
-        beats_per_bar,
-        small_character_style,
-        text_style,
-    );
+    update_settings_display(&mut display, small_character_style, text_style);
     display.flush().unwrap();
     let mut bpm_history: [f64; SMOOTHING_FACTOR] = [0.0; SMOOTHING_FACTOR];
     let mut bpm_index = 0;
@@ -122,14 +120,10 @@ fn main() -> anyhow::Result<()> {
                 7 => 4,
                 _ => 4,
             };
+            BEATS_PER_BAR.store(beats_per_bar, Ordering::SeqCst);
             // Reset the flag
             BUTTON_PRESSED.store(false, Ordering::SeqCst);
-            update_settings_display(
-                &mut display,
-                beats_per_bar,
-                small_character_style,
-                text_style,
-            );
+            update_settings_display(&mut display, small_character_style, text_style);
             button.enable_interrupt()?;
         }
         if uart.read(&mut buffer, timeout).is_ok() {
@@ -146,6 +140,33 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
             }
+
+            if status_byte == SYSEX_START {
+                let mut sysex_data = Vec::new(); // Use dynamic vector to accumulate data
+                let mut end_sysex = false;
+
+                while !end_sysex {
+                    let mut buf = [0u8; 1]; // Temporary buffer to read one byte at a time
+                    if uart.read(&mut buf, timeout).is_ok() {
+                        sysex_data.push(buf[0]); // Append the byte to the vector
+
+                        if buf[0] == SYSEX_END {
+                            end_sysex = true; // End of SysEx message
+                        }
+                    }
+                }
+
+                if sysex_data.len() > 2 {
+                    let payload = &sysex_data[1..sysex_data.len() - 1]; // Extract payload between start and end
+                    handle_sysex(
+                        payload.to_vec(),
+                        &mut display,
+                        small_character_style,
+                        text_style,
+                    );
+                }
+            }
+
             if let ControlFlow::Break(_) = handle_midi(
                 MidiMessage {
                     status_byte,
@@ -155,7 +176,6 @@ fn main() -> anyhow::Result<()> {
                 &mut last_time,
                 &mut bpm,
                 &mut beat,
-                beats_per_bar,
                 &mut display,
                 character_style,
                 text_style,
@@ -168,13 +188,30 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+fn handle_sysex(
+    sysex_data: Vec<u8>,
+    display: &mut Ssd1306<
+        I2CInterface<I2cDriver<'_>>,
+        DisplaySize128x64,
+        BufferedGraphicsMode<DisplaySize128x64>,
+    >,
+    character_style: MonoTextStyle<BinaryColor>,
+    text_style: TextStyle,
+) {
+    if sysex_data.len() > 5 && sysex_data[0] == 127 {
+        let beats_per_bar = sysex_data[4]; // The top part
+        BEATS_PER_BAR.store(beats_per_bar as u32, Ordering::SeqCst);
+        update_settings_display(display, character_style, text_style);
+        display.flush().unwrap();
+    }
+}
+
 fn handle_midi(
     midi_message: MidiMessage,
     clock_count: &mut u32,
     last_time: &mut i64,
     bpm: &mut f64,
     beat: &mut u32,
-    beats_per_bar: u32,
     display: &mut Ssd1306<
         I2CInterface<I2cDriver<'_>>,
         DisplaySize128x64,
@@ -211,7 +248,7 @@ fn handle_midi(
             // Calculate the moving average BPM
             let avg_bpm: f64 = bpm_history.iter().sum::<f64>() / SMOOTHING_FACTOR as f64;
             *bpm = avg_bpm;
-
+            let beats_per_bar = BEATS_PER_BAR.load(Ordering::SeqCst);
             // If clock count matches clocks per beat, update the beat
             if *clock_count == CLOCKS_PER_BEAT {
                 *beat += 1;
@@ -306,10 +343,10 @@ fn update_settings_display(
         DisplaySize128x64,
         BufferedGraphicsMode<DisplaySize128x64>,
     >,
-    beats: u32,
     character_style: MonoTextStyle<BinaryColor>,
     text_style: TextStyle,
 ) {
+    let beats = BEATS_PER_BAR.load(Ordering::SeqCst);
     Rectangle::new(Point::zero(), Size::new(12, 64))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
         .draw(display)
