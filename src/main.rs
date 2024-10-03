@@ -372,14 +372,16 @@ fn update_display(
     character_style: MonoTextStyle<BinaryColor>,
     text_style: TextStyle,
 ) {
+    let capped_bpm = if bpm > 999 { 999 } else { bpm };
+
     Rectangle::new(Point::new(12, 0), Size::new(118, 64))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
         .draw(display)
         .unwrap();
 
     Text::with_text_style(
-        &bpm.to_string(),
-        Point::new(45, 20),
+        &capped_bpm.to_string(),
+        Point::new(50, 20),
         character_style,
         text_style,
     )
