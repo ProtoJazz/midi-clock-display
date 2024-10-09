@@ -45,7 +45,7 @@ static BEATS_PER_BAR: AtomicU32 = AtomicU32::new(4);
 const MIDI_CLOCK: u8 = 0xF8;
 const MIDI_START: u8 = 0xF2;
 const EMPTY_BUFFER: u8 = 0x00;
-const CLOCKS_PER_BEAT: u32 = 24;
+static CLOCKS_PER_BEAT: AtomicU32 = AtomicU32::new(24);
 const CONTROL_CHANNEL: u32 = 10;
 const CONTROL_BYTE: u8 = (0xB0 + (CONTROL_CHANNEL - 1)) as u8;
 const MIDI_PAUSE: u8 = 0xFC;
@@ -201,6 +201,13 @@ fn handle_sysex(
     if sysex_data.len() > 5 && sysex_data[0] == 127 {
         let beats_per_bar = sysex_data[4]; // The top part
         BEATS_PER_BAR.store(beats_per_bar as u32, Ordering::SeqCst);
+        let clocks_per_beat_flag = sysex_data[5]; // The bottom part
+        if clocks_per_beat_flag == 2 {
+            CLOCKS_PER_BEAT.store(24 as u32, Ordering::SeqCst);
+        } else if clocks_per_beat_flag == 3 {
+            CLOCKS_PER_BEAT.store(12 as u32, Ordering::SeqCst);
+        }
+
         update_settings_display(display, character_style, text_style);
         display.flush().unwrap();
     }
@@ -238,10 +245,9 @@ fn handle_midi(
             let now = unsafe { esp_timer_get_time() }; // Current time in microseconds
             let time_per_clock = now - *last_time; // Time difference between this clock and the last one
             *last_time = now;
-
+            let clocks_per_beat = CLOCKS_PER_BEAT.load(Ordering::SeqCst);
             // Calculate BPM using time per clock event
-            let bpm_per_clock =
-                (60.0 * 1_000_000.0) / (time_per_clock as f64 * CLOCKS_PER_BEAT as f64);
+            let bpm_per_clock = (60.0 * 1_000_000.0) / (time_per_clock as f64 * 24.0);
             bpm_history[*bpm_index % SMOOTHING_FACTOR] = bpm_per_clock;
             *bpm_index = (*bpm_index + 1) % SMOOTHING_FACTOR;
 
@@ -250,7 +256,8 @@ fn handle_midi(
             *bpm = avg_bpm;
             let beats_per_bar = BEATS_PER_BAR.load(Ordering::SeqCst);
             // If clock count matches clocks per beat, update the beat
-            if *clock_count == CLOCKS_PER_BEAT {
+            if *clock_count == clocks_per_beat {
+                println!("BEAT");
                 *beat += 1;
                 if *beat > beats_per_bar {
                     *beat = 1;
