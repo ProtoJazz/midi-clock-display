@@ -1,0 +1,4 @@
+[midi-clock-display]
+wifi_ssid = "user"
+wifi_psk = "pass"
+mqtt_host = "localhost"

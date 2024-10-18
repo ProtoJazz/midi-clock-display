@@ -13,23 +13,31 @@ use embedded_graphics::{
     primitives::{PrimitiveStyle, Rectangle},
     text::{Alignment, Baseline, Text, TextStyle, TextStyleBuilder},
 };
-use esp_idf_svc::hal::units::FromValueType;
-use esp_idf_svc::hal::units::Hertz;
-use esp_idf_svc::hal::{
-    gpio,
-    i2c::{I2cConfig, I2cDriver},
-};
-use esp_idf_svc::hal::{
-    gpio::Gpio43, gpio::Gpio44, gpio::Gpio5, gpio::Gpio6, i2c::I2C0, peripherals::Peripherals,
-    uart::UART1,
-};
 use esp_idf_svc::hal::{
     gpio::{InterruptType, PinDriver, Pull},
     uart::{config::Config, UartDriver},
 };
 use esp_idf_svc::sys::esp_timer_get_time;
+use esp_idf_svc::{eventloop::EspSystemEventLoop, hal::units::FromValueType};
+use esp_idf_svc::{hal::units::Hertz, mqtt::client::MqttClientConfiguration};
+use esp_idf_svc::{
+    hal::{
+        gpio,
+        i2c::{I2cConfig, I2cDriver},
+    },
+    mqtt::client::EspMqttClient,
+};
+use esp_idf_svc::{
+    hal::{
+        gpio::{Gpio43, Gpio44, Gpio5, Gpio6},
+        i2c::I2C0,
+        peripherals::Peripherals,
+        uart::UART1,
+    },
+    mqtt::client::QoS,
+};
 use ssd1306::{mode::BufferedGraphicsMode, prelude::*, I2CDisplayInterface, Ssd1306};
-
+mod wifi;
 const SEVENT_SEGMENT_FONT: MonoFont = MonoFont {
     image: ImageRaw::new(include_bytes!("./seven-segment-font.raw"), 224),
     glyph_mapping: &StrGlyphMapping::new("0123456789", 0),
@@ -53,14 +61,41 @@ const MIDI_LOGGING: bool = false;
 const SMOOTHING_FACTOR: usize = 8; // Adjust this as needed
 const SYSEX_START: u8 = 0xF0;
 const SYSEX_END: u8 = 0xF7;
+const MQTT_TOPIC: &str = "esp32/midi";
+
+#[toml_cfg::toml_config]
+pub struct AppConfig {
+    #[default("127.0.0.1")]
+    mqtt_host: &'static str,
+    #[default("")]
+    mqtt_user: &'static str,
+    #[default("")]
+    mqtt_pass: &'static str,
+    #[default("")]
+    wifi_ssid: &'static str,
+    #[default("")]
+    wifi_psk: &'static str,
+}
 
 fn gpio_isr_handler() {
     // Set the BUTTON_PRESSED flag to true
     BUTTON_PRESSED.store(true, Ordering::SeqCst);
 }
+fn configure_mqtt(app_config: &AppConfig) -> MqttClientConfiguration<'static> {
+    MqttClientConfiguration {
+        protocol_version: Some(esp_idf_svc::mqtt::client::MqttProtocolVersion::V3_1_1), // Set protocol version if needed
+        client_id: Some("esp32_client".into()), // Example client ID
+        keep_alive_interval: Some(std::time::Duration::from_secs(60)), // Set keep-alive interval
+        network_timeout: std::time::Duration::from_secs(30), // Example timeout
+        crt_bundle_attach: None,
+        use_global_ca_store: false,
+        ..Default::default()
+    }
+}
 
 fn main() -> anyhow::Result<()> {
     let peripherals = Peripherals::take().unwrap();
+    let sysloop = EspSystemEventLoop::take()?;
 
     let uart1 = peripherals.uart1;
     let gpio43 = peripherals.pins.gpio43;
@@ -71,6 +106,41 @@ fn main() -> anyhow::Result<()> {
     let gpio5 = peripherals.pins.gpio5;
     let gpio6 = peripherals.pins.gpio6;
     let mut display = setup_i2c_display(i2c0, gpio5, gpio6)?;
+
+    let app_config = APP_CONFIG;
+
+    // Initialize NVS
+    let err = unsafe { esp_idf_svc::sys::nvs_flash_init() };
+
+    if err == esp_idf_svc::sys::ESP_ERR_NVS_NO_FREE_PAGES
+        || err == esp_idf_svc::sys::ESP_ERR_NVS_NEW_VERSION_FOUND
+    {
+        // Erase NVS and retry initialization
+        unsafe {
+            esp_idf_svc::sys::nvs_flash_erase();
+            esp_idf_svc::sys::nvs_flash_init();
+        }
+    }
+
+    println!("NVS initialized successfully");
+    println!("Connecting to Wi-Fi");
+    // Connect to the Wi-Fi network
+    let _wifi = wifi::wifi(
+        app_config.wifi_ssid,
+        app_config.wifi_psk,
+        peripherals.modem,
+        sysloop,
+    )?;
+    println!("Connected to Wi-Fi");
+
+    let broker_url = format!("mqtt://{}:1883", app_config.mqtt_host);
+    println!("Broker URL{}", broker_url);
+    let mqtt_config = configure_mqtt(&app_config);
+    let mut mqtt_client =
+        EspMqttClient::new_cb(&broker_url, &mqtt_config, move |_message_event| {
+            // ... your handler code here - leave this empty for now
+            // we'll add functionality later in this chapter
+        })?;
 
     // Configures the button
     let mut button = PinDriver::input(peripherals.pins.gpio2)?;
@@ -181,6 +251,7 @@ fn main() -> anyhow::Result<()> {
                 text_style,
                 &mut bpm_history,
                 &mut bpm_index,
+                &mut mqtt_client,
             ) {
                 continue;
             }
@@ -228,6 +299,7 @@ fn handle_midi(
     text_style: TextStyle,
     bpm_history: &mut [f64; SMOOTHING_FACTOR],
     bpm_index: &mut usize,
+    mqtt_client: &mut EspMqttClient,
 ) -> ControlFlow<()> {
     let channel = get_midi_channel(midi_message.status_byte);
     if MIDI_LOGGING {
@@ -257,10 +329,14 @@ fn handle_midi(
             let beats_per_bar = BEATS_PER_BAR.load(Ordering::SeqCst);
             // If clock count matches clocks per beat, update the beat
             if *clock_count == clocks_per_beat {
-                println!("BEAT");
                 *beat += 1;
                 if *beat > beats_per_bar {
                     *beat = 1;
+                    let message = bpm.round().to_string(); // Convert the number to a string
+
+                    mqtt_client
+                        .enqueue(MQTT_TOPIC, QoS::AtLeastOnce, true, message.as_bytes())
+                        .unwrap();
                 }
                 *clock_count = 0; // Reset the clock count after a full beat
 
